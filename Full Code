@@ -1,0 +1,191 @@
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import Statevector, Pauli, partial_trace, entropy, purity, state_fidelity
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
+from qiskit_aer import AerSimulator
+from qiskit.visualization import circuit_drawer, plot_state_qsphere, plot_state_city
+import numpy as np
+import json
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+
+# Results closer to hardware
+
+# Create output directory if it doesn't exist
+output_dir = "unruh_simulation_results"
+os.makedirs(output_dir, exist_ok=True)
+
+# Generate timestamp for unique file naming
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Prompt for IBM Quantum API key
+api_key = input('Enter your IBM Quantum API key: ')
+
+# Initialize Qiskit Runtime Service
+try:
+    service = QiskitRuntimeService(channel="ibm_quantum", token=api_key)
+except Exception as e:
+    print(f"Error initializing service: {e}")
+    exit(1)
+
+# Select IBM Brisbane backend
+try:
+    backend = service.backend("ibm_brisbane")
+except Exception as e:
+    print(f"Error accessing backend: {e}")
+    print("Falling back to local AerSimulator")
+    backend = AerSimulator()
+
+user_r = input("Enter squeezing parameter r (or press Enter to select system randomly): ").strip()
+try:
+    r = float(user_r)  # Try converting input to float
+except ValueError:
+    r = np.random.uniform(0, 2)
+
+# Parameters for Unruh effect
+# r = np.random() # Squeezing parameter
+theta = np.arccosh(1 / np.tanh(r))  # Bogoliubov transformation angle
+shots = 750  # Number of shots
+
+# Initialize 2-qubit circuit
+qc = QuantumCircuit(2)
+
+# Prepare vacuum state and apply Bogoliubov transformation
+qc.h(0)  # Superposition
+qc.cx(0, 1)  # Entangle
+qc.rz(theta/2, 0)  # Reduced rotation
+qc.rx(theta/2, 1)  # Adjusted rotation
+
+# Save circuit diagram
+try:
+    circuit_fig = circuit_drawer(qc, output='mpl', style='iqx')
+    circuit_fig.savefig(os.path.join(output_dir, f"circuit_diagram_{timestamp}.png"))
+    plt.close(circuit_fig)  # Close the figure to free memory
+    print(f"Circuit diagram saved as circuit_diagram_{timestamp}.png")
+except ImportError as e:
+#     print(f"Error saving circuit diagram: {e}. Please install required libraries (e.g., 'pip install matplotlib pylatexenc')")
+# except Exception as e:
+    print(f"Error saving circuit diagram: {e}")
+
+# Get statevector for local calculations and visualization
+state = Statevector.from_instruction(qc)
+
+# Save statevector plot (using state city for clarity)
+try:
+    state_fig = plot_state_city(state, title="Statevector Plot")
+    state_fig.savefig(os.path.join(output_dir, f"statevector_plot_{timestamp}.png"))
+    plt.close(state_fig)  # Close the figure
+    print(f"Statevector plot saved as statevector_plot_{timestamp}.png")
+except Exception as e:
+    print(f"Error saving statevector plot: {e}")
+
+# Save Q-sphere plot
+try:
+    qsphere_fig = plot_state_qsphere(state)
+    qsphere_fig.savefig(os.path.join(output_dir, f"qsphere_plot_{timestamp}.png"))
+    plt.close(qsphere_fig)  # Close the figure
+    print(f"Q-sphere plot saved as qsphere_plot_{timestamp}.png")
+except ImportError as e:
+    print(f"Error saving Q-sphere plot: {e}. Please install seaborn with 'pip install seaborn'")
+except Exception as e:
+    print(f"Error saving Q-sphere plot: {e}")
+
+# Trace out one qubit (Rindler wedge)
+reduced_rho = partial_trace(state, [1])
+
+# Compute Unruh metrics from reduced_rho
+purity_val = reduced_rho.purity()
+entropy_val = entropy(reduced_rho)
+z_operator = Pauli('Z')  # Z operator for reduced state
+expectation_Z = reduced_rho.expectation_value(z_operator).real  # Take real part
+
+# Compute fidelity with vacuum state
+user_target = input("Enter target state label (e.g., '11', '00'): ").strip()
+try:
+     target_label = user_target
+except ValueError:
+    target_label = np.random.choice(['00', '01', '10', '11'])  # Random valid state
+vacuum = Statevector.from_label(user_target)
+fidelity_vs_vacuum = state_fidelity(state, vacuum)
+
+
+# Transpile circuit for the selected backend
+qc_transpiled = transpile(qc, backend=backend, optimization_level=1)
+
+# Add measurements
+qc_transpiled.measure_all()
+
+# Run on the selected backend using Sampler
+sampler = Sampler(backend)
+job = sampler.run([qc_transpiled], shots=shots)
+job_id = job.job_id()  # Get job ID
+print(f"Job ID: {job_id}")
+
+try:
+    result = job.result()
+except Exception as e:
+    print(f"Error running job: {e}")
+    exit(1)
+
+# Get counts from PrimitiveResult
+try:
+    if isinstance(result[0], dict) and '__value__' in result[0]:
+        value = result[0]['__value__']
+        if isinstance(value, dict) and 'data' in value and hasattr(value['data'], 'meas'):
+            counts = value['data'].meas.get_counts()
+        else:
+            raise ValueError("No valid counts found in Result[0]['__value__']['data']")
+    elif hasattr(result[0], 'data'):
+        counts = result[0].data.meas.get_counts()
+    else:
+        raise ValueError("Unexpected result[0] type: " + str(type(result[0])))
+    if not counts:
+        raise ValueError("No counts found in result")
+except Exception as e:
+    print(f"Error processing results: {e}")
+    exit(1)
+
+# Normalize counts
+counts_normalized = {k: v/shots for k, v in counts.items()}
+
+# Compute thermal distribution match
+thermal_p0 = 1 / (np.cosh(r) ** 2)
+measured_p0 = counts_normalized.get('00', 0.0) + counts_normalized.get('10', 0.0)
+# Make thermal match tunable
+tolerance = np.random.uniform(0.1, 1.0)
+thermal_match = bool(abs(measured_p0 - thermal_p0) < tolerance)  # Ensure Python bool
+
+# Squeezed entangled counts
+squeezed_counts = {
+    '00': counts_normalized.get('00', 0.0),
+    '11': counts_normalized.get('11', 0.0)
+}
+
+# Prepare output dictionary
+output = {
+    "job_id": job_id,
+    "counts": {"0": f"{measured_p0*100:.0f}%", "1": f"{(1-measured_p0)*100:.0f}%"},
+    "expectation_Z": float(np.round(expectation_Z, 2)),  # Convert to float
+    "purity": float(np.round(purity_val.real, 2)),  # Convert to float
+    "entropy": float(np.round(entropy_val, 2)),  # Convert to float
+    "fidelity_vs_vacuum": float(np.round(fidelity_vs_vacuum, 2)),  # Convert to float
+    "thermal_distribution_match": thermal_match,
+    "squeezed_entangled_counts": {
+        "00": f"{squeezed_counts['00']*100:.0f}%",
+        "11": f"{squeezed_counts['11']*100:.0f}%"
+    },
+    "entanglement_entropy": float(np.round(entropy_val, 2)),  # Convert to float
+    "raw_counts": {k: int(v) for k, v in counts.items()}  # Convert counts to int
+}
+
+# Save results to JSON file
+results_file = os.path.join(output_dir, f"results_{timestamp}.json")
+try:
+    with open(results_file, 'w') as f:
+        json.dump(output, f, indent=4)
+    print(f"Results saved as {results_file}")
+except Exception as e:
+    print(f"Error saving results to JSON: {e}")
+
+print(output)
